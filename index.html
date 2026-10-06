@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>EchoSystem</title>
+<style>
+:root{--bg:#fafafa;--fg:#161616;--mut:#777;--line:#d9d9d9;--on:#161616;--onfg:#fafafa;--rec:#c8322b}
+@media(prefers-color-scheme:dark){:root{--bg:#141414;--fg:#eee;--mut:#888;--line:#333;--on:#eee;--onfg:#141414}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+.app{max-width:440px;margin:0 auto;min-height:100vh;display:flex;flex-direction:column;border-left:1px solid var(--line);border-right:1px solid var(--line)}
+header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:18px;margin:0;flex:1;font-weight:600}
+.path{padding:8px 16px;color:var(--mut);font-size:14px;border-bottom:1px solid var(--line)}
+button{font:inherit;color:inherit;background:none;border:1px solid var(--line);border-radius:8px;min-height:44px;min-width:44px;padding:0 12px;cursor:pointer}
+button.on,button.pri{background:var(--on);color:var(--onfg);border-color:var(--on)}
+button.recording{background:var(--rec);border-color:var(--rec);color:#fff}
+.list{flex:1}
+.row{display:flex;align-items:center;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.row .t{flex:1;min-width:0;cursor:pointer;overflow:hidden;text-overflow:ellipsis}
+.row small{display:block;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row button{min-width:40px;padding:0 6px;border-color:transparent}
+.row button.on{border-color:var(--on)}
+.empty{padding:24px 16px;color:var(--mut)}
+textarea{flex:1;width:100%;min-height:70vh;border:0;background:none;color:inherit;font:16px/1.6 system-ui,sans-serif;padding:16px;resize:none;outline:0}
+.bar{flex-wrap:wrap;display:flex;align-items:center;gap:8px;padding:10px 16px;border-top:1px solid var(--line);position:sticky;bottom:0;background:var(--bg)}
+.bar .sp{flex:1}
+.tool{display:flex;flex-wrap:wrap;gap:8px;padding:10px 16px;border-bottom:1px solid var(--line);align-items:center}
+select,input[type=number]{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:8px;min-height:44px;padding:0 8px}
+.tool select{flex:1 1 100%;min-width:0}
+.app.fix{height:100vh;height:100dvh}
+.grid{overflow:auto;flex:1;min-height:0;padding:12px 0}
+.g{display:grid;gap:3px;padding:0 12px;width:max-content}
+.g span{height:34px;border:1px solid var(--line);border-radius:4px}
+.g span.lbl{border:0;color:var(--mut);font-size:13px;display:flex;align-items:center;position:sticky;left:0;background:var(--bg)}
+.g span.on{background:var(--on);border-color:var(--on)}
+.g span.beat{border-left-color:var(--mut)}
+#sheet{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:flex-end;justify-content:center}
+#sheet div{background:var(--bg);width:100%;max-width:440px;border-radius:12px 12px 0 0;padding:8px 0 calc(8px + env(safe-area-inset-bottom,0px))}
+#sheet button{display:block;width:100%;text-align:left;border:0;border-radius:0;padding:0 20px;min-height:52px}
+</style>
+</head>
+<body>
+<div class="app" id="app"></div>
+<input type="file" id="fi" multiple hidden>
+<script>
+// ---- Capa de guardado (se reemplaza por archivos del teléfono en el APK) ----
+const Store=(()=>{let db;
+  const tx=(m,f)=>new Promise((ok,er)=>{const t=db.transaction('items',m),q=f(t.objectStore('items'));t.oncomplete=()=>ok(q&&q.result);t.onerror=()=>er(t.error)});
+  return{
+    init:()=>new Promise((ok,er)=>{const r=indexedDB.open('estudio',1);r.onupgradeneeded=()=>r.result.createObjectStore('items',{keyPath:'id'});r.onsuccess=()=>{db=r.result;ok()};r.onerror=()=>er(r.error)}),
+    all:()=>tx('readonly',s=>s.getAll()),
+    put:i=>tx('readwrite',s=>s.put(i)),
+    del:id=>tx('readwrite',s=>s.delete(id))}})();
+
+// ---- Estado ----
+let items=[],cur=null,view='folder',menuId=null,moveId=null,editId=null,addMenu=false,rec=null;
+const playing=new Map();
+const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+const byId=id=>items.find(i=>i.id===id);
+const kids=p=>items.filter(i=>i.parent===p&&!i.trashed).sort((a,b)=>(a.type==='folder'?0:1)-(b.type==='folder'?0:1)||a.created-b.created);
+const live=i=>{while(i){if(i.trashed)return false;i=i.parent&&byId(i.parent)}return true};
+const pathOf=id=>{const n=[];let i=id&&byId(id);while(i){n.unshift(i.name);i=i.parent&&byId(i.parent)}return n.join(' › ')||'Inicio'};
+const isIn=(i,anc)=>{while(i){if(i.id===anc)return true;i=i.parent&&byId(i.parent)}return false};
+const fmt=s=>Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
+const E=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const save=i=>Store.put(i);
+const isT=i=>i.type==='track'||i.type==='notes'||i.type==='drums';
+const NN=p=>['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][p%12]+(Math.floor(p/12)-1);
+const DR=[{p:49,n:'Platillo'},{p:45,n:'Tom'},{p:42,n:'Hi-hat'},{p:38,n:'Caja'},{p:36,n:'Bombo'}];
+const subOf=t=>t.type==='track'?'Audio · '+fmt(t.dur||0):(t.type==='drums'?'Batería':'Notas')+' · '+t.bars+' c. · '+t.bpm+' bpm';
+let AC;const ac=()=>{AC=AC||new AudioContext();if(AC.state==='suspended')AC.resume();return AC};
+
+// ---- Reproducción ----
+function start(id){const t=byId(id);if(!t||playing.has(id))return;if(t.type!=='track')return startSeq(t);if(!t.blob)return;
+  const a=new Audio(URL.createObjectURL(t.blob));a.loop=!!t.loop;
+  a.onended=()=>{playing.delete(id);render()};playing.set(id,a);a.play()}
+function stop(id){const a=playing.get(id);if(a){a.pause();URL.revokeObjectURL(a.src);playing.delete(id)}}
+const tracksHere=()=>view==='stars'?items.filter(i=>i.starred&&isT(i)&&live(i)):kids(cur).filter(isT);
+
+// ---- SoundFont (.sf2): lectura y reproducción ----
+function parseSF2(buf){const d=new DataView(buf),u=new Uint8Array(buf),S=(o,n)=>String.fromCharCode(...u.subarray(o,o+n)).replace(/\0.*$/,'');
+  const ch={};let o=12;
+  while(o<buf.byteLength-8){const id=S(o,4),sz=d.getUint32(o+4,true);if(id==='LIST'){let q=o+12;while(q<o+8+sz){const c=S(q,4),cs=d.getUint32(q+4,true);ch[c]=[q+8,cs];q+=8+cs+(cs&1)}}o+=8+sz+(sz&1)}
+  if(!ch.smpl||!ch.phdr)throw new Error('SoundFont no válido (¿es .sf3?)');
+  const rec=(c,z,f)=>{const[a,n]=ch[c],r=[];for(let i=0;i<n/z;i++)r.push(f(a+i*z));return r};
+  const gens=c=>rec(c,4,a=>{const g=d.getUint16(a,true);return{o:g,v:g===43||g===44?[d.getUint8(a+2),d.getUint8(a+3)]:(g===41||g===53?d.getUint16(a+2,true):d.getInt16(a+2,true))}});
+  const all=rec('phdr',38,a=>({name:S(a,20),prog:d.getUint16(a+20,true),bank:d.getUint16(a+22,true),b:d.getUint16(a+24,true)}));
+  return{all,presets:all.slice(0,-1),pbag:rec('pbag',4,a=>d.getUint16(a,true)),pgen:gens('pgen'),inst:rec('inst',22,a=>({b:d.getUint16(a+20,true)})),
+    ibag:rec('ibag',4,a=>d.getUint16(a,true)),igen:gens('igen'),
+    shdr:rec('shdr',46,a=>({start:d.getUint32(a+20,true),end:d.getUint32(a+24,true),sl:d.getUint32(a+28,true),el:d.getUint32(a+32,true),rate:d.getUint32(a+36,true),pitch:d.getUint8(a+40),corr:d.getInt8(a+41)})),
+    smpl:ch.smpl[0],dv:d,z:{},c:{}}}
+let dl=false;
+const DEFURL='https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2';
+async function addFont(f,name){const h=new Uint8Array(await f.slice(0,12).arrayBuffer()),S=(a,b)=>String.fromCharCode(...h.slice(a,b));
+  if(S(0,4)!=='RIFF'||S(8,12)!=='sfbk')throw new Error('el archivo no es un SoundFont .sf2');
+  const it={id:uid(),parent:'__fonts__',type:'font',name,size:f.size,blob:f,created:Date.now()};items.push(it);await save(it)}
+const FONTS={},FP={};
+const loadFont=id=>FONTS[id]||(FONTS[id]=byId(id).blob.arrayBuffer().then(parseSF2).then(F=>{FP[id]=F;if(view==='seq')render();return F}));
+const loadAll=()=>items.filter(i=>i.type==='font').forEach(f=>loadFont(f.id).catch(()=>{}));
+const zonesOf=(bag,gen,b0,b1,term)=>{let glob={},r=[];for(let b=b0;b<b1;b++){const g={};for(let i=bag[b];i<bag[b+1];i++)g[gen[i].o]=gen[i].v;if(g[term]===undefined){if(b===b0)glob=g}else r.push({...glob,...g})}return r};
+function getZones(F,bank,prog){const k=bank+'/'+prog;if(F.z[k])return F.z[k];
+  const i=F.presets.findIndex(p=>p.bank===bank&&p.prog===prog),out=[];
+  if(i>=0)for(const pz of zonesOf(F.pbag,F.pgen,F.all[i].b,F.all[i+1].b,41)){const I=pz[41];
+    for(const z of zonesOf(F.ibag,F.igen,F.inst[I].b,F.inst[I+1].b,53)){
+      const rg=o=>{const a=z[o]||[0,127],b=pz[o]||[0,127];return[Math.max(a[0],b[0]),Math.min(a[1],b[1])]};
+      out.push({kr:rg(43),vr:rg(44),id:z[53],root:z[58]===undefined?-1:z[58],coarse:z[51]||0,fine:z[52]||0,sc:z[56]??100,att:z[48]||0,mode:z[54]||0,a:z[34]??-12000,d:z[36]??-12000,s:z[37]||0,r:z[38]??-12000})}}
+  return F.z[k]=out}
+function sampleBuf(F,id){if(F.c[id])return F.c[id];const h=F.shdr[id],n=Math.max(h.end-h.start,1),b=ac().createBuffer(1,n,h.rate),f=b.getChannelData(0);
+  for(let i=0;i<n;i++)f[i]=F.dv.getInt16(F.smpl+2*(h.start+i),true)/32768;return F.c[id]={b,h}}
+function voice(F,Z,key,vel,at,dur,c,one){const C=ac();
+  for(const z of Z){if(key<z.kr[0]||key>z.kr[1]||vel<z.vr[0]||vel>z.vr[1])continue;
+    const{b,h}=sampleBuf(F,z.id),src=C.createBufferSource(),g=C.createGain();src.buffer=b;
+    const root=z.root>=0?z.root:(h.pitch>127?60:h.pitch);
+    src.playbackRate.value=Math.pow(2,(key-root)*z.sc/1200+(z.coarse*100+z.fine+h.corr)/1200);
+    if(z.mode&1){src.loop=true;src.loopStart=(h.sl-h.start)/h.rate;src.loopEnd=(h.el-h.start)/h.rate}
+    const A=Math.max(Math.pow(2,z.a/1200),.003),R=Math.min(Math.pow(2,z.r/1200),3)+.03,pk=Math.pow(10,-z.att/200)*vel/127*.6,sus=pk*Math.pow(10,-z.s/200);
+    g.gain.setValueAtTime(0,at);g.gain.linearRampToValueAtTime(pk,at+A);g.gain.setTargetAtTime(sus,at+A,Math.pow(2,z.d/1200)/4+.001);
+    if(!one)g.gain.setTargetAtTime(0,at+dur,R/4);
+    src.connect(g).connect(C.destination);src.start(at);if(!one)src.stop(at+dur+R+.2);
+    const v={src,g};c.v.add(v);src.onended=()=>c.v.delete(v)}}
+function startSeq(t){const id=t.id,C=ac();
+  const c={v:new Set(),dead:0,timer:0,src:'',loop:0,pause(){this.dead=1;clearTimeout(this.timer);this.v.forEach(x=>{try{x.g.gain.cancelScheduledValues(0);x.g.gain.setTargetAtTime(0,C.currentTime,.02);x.src.stop(C.currentTime+.2)}catch(e){}})}};
+  playing.set(id,c);render();
+  (async()=>{let Z=[],F;try{const r=t.inst.split('|');F=await loadFont(r[0]);Z=getZones(F,+r[1],+r[2])}catch(e){}
+    if(c.dead)return;
+    if(!Z.length){playing.delete(id);render();alert('Esta pista no tiene instrumento. Elígelo en la pista (necesitas importar un SoundFont en Instrumentos).');return}
+    const sd=60/(t.bpm||120)/4,len=t.bars*16*sd,one=t.type==='drums';
+    const pass=at=>{t.notes.forEach(n=>voice(F,Z,n.p,100,at+n.s*sd,n.l*sd,c,one));
+      const wait=(at+len-C.currentTime)*1000;
+      c.timer=setTimeout(()=>{if(c.dead)return;if(t.loop)pass(at+len);else{playing.delete(id);render()}},t.loop?Math.max(0,wait-200):wait+(one?1500:300))};
+    pass(C.currentTime+.12)})()}
+async function preview(T,p){try{const r=T.inst.split('|'),F=await loadFont(r[0]);voice(F,getZones(F,+r[1],+r[2]),p,100,ac().currentTime,.5,{v:new Set()},T.type==='drums')}catch(e){}}
+
+// ---- Grabación (WAV 48 kHz, 16 bits, sin filtros del navegador) ----
+function wav(chunks,sr){const n=chunks.reduce((a,c)=>a+c.length,0),b=new DataView(new ArrayBuffer(44+n*2));
+  const w=(o,s)=>[...s].forEach((c,i)=>b.setUint8(o+i,c.charCodeAt(0)));
+  w(0,'RIFF');b.setUint32(4,36+n*2,true);w(8,'WAVEfmt ');b.setUint32(16,16,true);b.setUint16(20,1,true);b.setUint16(22,1,true);
+  b.setUint32(24,sr,true);b.setUint32(28,sr*2,true);b.setUint16(32,2,true);b.setUint16(34,16,true);w(36,'data');b.setUint32(40,n*2,true);
+  let o=44;for(const c of chunks)for(const x of c){const v=Math.max(-1,Math.min(1,x));b.setInt16(o,v<0?v*32768:v*32767,true);o+=2}
+  return{blob:new Blob([b],{type:'audio/wav'}),dur:n/sr}}
+async function toggleRec(){
+  if(rec){const r=rec;rec=null;r.stream.getTracks().forEach(t=>t.stop());const sr=r.ctx.sampleRate;await r.ctx.close();
+    const {blob,dur}=wav(r.chunks,sr);
+    const t={id:uid(),parent:r.parent,type:'track',name:'Grabación '+(items.filter(i=>i.type==='track').length+1),blob,dur,created:Date.now()};
+    items.push(t);await save(t);return render()}
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+    const ctx=new AudioContext({sampleRate:48000});
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([`registerProcessor('rec',class extends AudioWorkletProcessor{process(i){if(i[0][0])this.port.postMessage(i[0][0].slice());return true}})`],{type:'text/javascript'})));
+    const node=new AudioWorkletNode(ctx,'rec'),silent=ctx.createGain(),chunks=[];silent.gain.value=0;
+    node.port.onmessage=e=>chunks.push(e.data);
+    ctx.createMediaStreamSource(stream).connect(node);node.connect(silent);silent.connect(ctx.destination);
+    rec={ctx,stream,chunks,parent:cur};
+  }catch(e){alert('No se pudo usar el micrófono: '+e.message)}
+  render()}
+
+// ---- Acciones sobre elementos ----
+async function dup(i,parent){const c={...i,id:uid(),parent,starred:false,created:Date.now(),name:parent===i.parent?i.name+' copia':i.name};
+  items.push(c);await save(c);
+  if(i.type==='folder')for(const k of items.filter(x=>x.parent===i.id&&!x.trashed))await dup(k,c.id)}
+async function purge(id){for(const k of items.filter(x=>x.parent===id))await purge(k.id);stop(id);items=items.filter(x=>x.id!==id);await Store.del(id)}
+
+// ---- Vistas ----
+const btn=(a,id,t,on)=>`<button class="${on?'on':''}" data-act="${a}" data-id="${id}">${t}</button>`;
+const head=(back,title,extra='')=>`<header>${back?'<button data-act="back">‹</button>':''}<h1>${E(title)}</h1>${extra}</header>`;
+const empty=t=>`<div class="empty">${t}</div>`;
+const trackRow=(t,sub)=>`<div class="row"><div class="t"${t.type!=='track'?` data-act="seq" data-id="${t.id}"`:''}>${E(t.name)}<small>${sub}</small></div>${btn('play',t.id,playing.has(t.id)?'■':'▶',playing.has(t.id))}${btn('loop',t.id,'↻',t.loop)}${btn('mute',t.id,'M',t.mute)}${btn('star',t.id,t.starred?'★':'☆')}${btn('menu',t.id,'⋮')}</div>`;
+const folderRow=f=>{const n=kids(f.id).length;return `<div class="row"><div class="t" data-act="open" data-id="${f.id}">${E(f.name)}<small>carpeta · ${n} elemento${n==1?'':'s'}</small></div>${btn('menu',f.id,'⋮')}</div>`};
+const lyricsRow=l=>`<div class="row"><div class="t" data-act="edit" data-id="${l.id}">${E(l.name)}<small>${E((l.text||'').split('\n')[0]||'Letra vacía')}</small></div>${btn('menu',l.id,'⋮')}</div>`;
+const allBtn=()=>{const on=tracksHere().some(t=>playing.has(t.id));return `<button class="pri" data-act="all">${on?'■':'▶'} Todo</button>`};
+
+function render(){
+  const app=document.getElementById('app'),f=cur&&byId(cur);let h='';
+  if(view==='stars'){
+    const l=tracksHere();
+    h=head(1,'Destacadas')+`<div class="list">${l.map(t=>trackRow(t,E(pathOf(t.parent)))).join('')||empty('Marca pistas con ☆ y aparecerán aquí.')}</div><div class="bar">${allBtn()}</div>`;
+  }else if(view==='trash'){
+    const l=items.filter(i=>i.trashed);
+    h=head(1,'Papelera')+`<div class="list">${l.map(i=>`<div class="row"><div class="t">${E(i.name)}<small>${({folder:'carpeta',lyrics:'letra',notes:'pista de notas',drums:'batería'})[i.type]||'pista'}</small></div>${btn('restore',i.id,'Restaurar')}${btn('purge',i.id,'Eliminar')}</div>`).join('')||empty('La papelera está vacía.')}</div>`;
+  }else if(view==='fonts'){
+    const l=items.filter(i=>i.type==='font');
+    h=head(1,'Instrumentos')+`<div class="list">${l.map(i=>`<div class="row"><div class="t">${E(i.name)}<small>${(i.size/1048576).toFixed(1)} MB</small></div>${btn('delfont',i.id,'Eliminar')}</div>`).join('')||empty('Importa un archivo .sf2 para tener instrumentos. Sin él las pistas de notas y batería no suenan.')}</div><div class="bar"><button class="pri" data-act="import">Importar .sf2</button><button data-act="url">${dl?'Descargando…':'Desde enlace'}</button></div>`;
+  }else if(view==='seq'){
+    const T=byId(editId),dr=T.type==='drums',st=T.bars*16,fl=items.filter(i=>i.type==='font');
+    const rows=dr?DR:Array.from({length:25},(_,i)=>{const p=T.lo+24-i;return{p,n:NN(p)}});
+    const cov=new Set();T.notes.forEach(n=>{for(let k=0;k<n.l;k++)cov.add(n.p+'_'+(n.s+k))});
+    const opts=fl.map(x=>FP[x.id]?`<optgroup label="${E(x.name)}">${FP[x.id].presets.filter(q=>dr?q.bank===128:q.bank!==128).map(q=>{const v=x.id+'|'+q.bank+'|'+q.prog;return `<option value="${v}"${T.inst===v?' selected':''}>${E(q.name)}</option>`}).join('')}</optgroup>`:'').join('');
+    h=head(1,T.name)+`<div class="tool"><select data-sel="inst"><option value="">${fl.length?'Elige instrumento…':'Sin SoundFonts: impórtalos en Instrumentos'}</option>${opts}</select>
+      <label>Tempo <input type="number" data-sel="bpm" min="40" max="300" value="${T.bpm}" style="width:80px"></label>
+      ${btn('bars-',T.id,'−')}<span>${T.bars} compás${T.bars>1?'es':''}</span>${btn('bars+',T.id,'+')}
+      ${dr?'':`<select data-sel="dur" style="flex:0 0 auto">${[1,2,4,8].map(n=>`<option value="${n}"${(T.dur||1)===n?' selected':''}>${n} paso${n>1?'s':''}</option>`).join('')}</select>${btn('oct-',T.id,'8vb')}${btn('oct+',T.id,'8va')}`}</div>
+      <div class="grid"><div class="g" style="grid-template-columns:56px repeat(${st},32px)">${rows.map(r=>`<span class="lbl">${r.n}</span>`+Array.from({length:st},(_,i)=>`<span data-act="cell" data-p="${r.p}" data-s="${i}" class="${cov.has(r.p+'_'+i)?'on':''} ${i%4?'':'beat'}"></span>`).join('')).join('')}</div></div>
+      <div class="bar">${btn('play',T.id,playing.has(T.id)?'■':'▶',playing.has(T.id))}${btn('loop',T.id,'↻ Loop',T.loop)}</div>`;
+  }else if(view==='lyrics'){
+    const L=byId(editId);h=head(1,L.name)+`<div class="path">${E(pathOf(L.parent))}</div><textarea id="lyr" placeholder="Escribe aquí la letra…">${E(L.text||'')}</textarea>`;
+  }else if(view==='move'){
+    const m=byId(moveId),c=items.filter(i=>i.type==='folder'&&!i.trashed&&live(i)&&!isIn(i,m.id));
+    h=head(1,'Mover a…')+`<div class="list">${m.type==='lyrics'?'':'<div class="row"><div class="t" data-act="dest" data-id="">Inicio</div></div>'}${c.map(i=>`<div class="row"><div class="t" data-act="dest" data-id="${i.id}">${E(pathOf(i.id))}</div></div>`).join('')}</div>`;
+  }else{
+    const l=kids(cur);
+    const top=f?'':`<div class="row"><div class="t" data-act="stars">★ Destacadas<small>${items.filter(i=>i.starred&&isT(i)&&live(i)).length} pistas</small></div></div><div class="row"><div class="t" data-act="fonts">Instrumentos<small>${items.filter(i=>i.type==='font').length} archivos</small></div></div>`;
+    const low=f?'':`<div class="row"><div class="t" data-act="trash">Papelera<small>${items.filter(i=>i.trashed).length} elementos</small></div></div>`;
+    h=head(f,f?f.name:'EchoSystem',f?btn('menu',f.id,'⋮'):'')+(f?`<div class="path">${E(pathOf(cur))}</div>`:'')
+     +`<div class="list">${top}`
+     +`${l.map(i=>i.type==='folder'?folderRow(i):i.type==='lyrics'?lyricsRow(i):trackRow(i,subOf(i))).join('')||empty('Aquí no hay nada todavía. Crea una carpeta o graba una pista.')}${low}</div>`
+     +`<div class="bar">${allBtn()}<button class="${rec?'recording':''}" data-act="rec">${rec?'■ Detener':'● Grabar'}</button><span class="sp"></span><button data-act="add">+ Nuevo</button></div>`;
+  }
+  if(addMenu)h+=`<div id="sheet" data-act="close"><div>${btn('m_nf','','Carpeta')}${cur?btn('m_nl','','Letra'):''}${btn('m_nn','','Pista de notas')}${btn('m_nd','','Pista de batería')}</div></div>`;else if(menuId)h+=`<div id="sheet" data-act="close"><div>${['rename:Renombrar','move:Reubicar','dup:Duplicar','trash:Enviar a la papelera'].map(x=>{const[a,t]=x.split(':');return btn('m_'+a,menuId,t)}).join('')}</div></div>`;
+  const gs=document.querySelector('.grid'),sx=gs?gs.scrollLeft:0,sy=gs?gs.scrollTop:0;
+  app.className='app'+(view==='seq'?' fix':'');
+  app.innerHTML=h;
+  const g2=document.querySelector('.grid');if(g2){g2.scrollLeft=sx;g2.scrollTop=sy}
+}
+
+// ---- Eventos ----
+document.addEventListener('input',e=>{if(e.target.id==='lyr'){const f=byId(editId);f.text=e.target.value;save(f)}});
+document.addEventListener('change',async e=>{const k=e.target.dataset.sel;if(!k)return;const T=byId(editId);
+  if(k==='inst')T.inst=e.target.value;else if(k==='bpm')T.bpm=Math.min(300,Math.max(40,+e.target.value||120));else if(k==='dur')T.dur=+e.target.value;
+  await save(T);render()});
+document.getElementById('fi').onchange=async e=>{
+  for(const f of e.target.files){const h=new Uint8Array(await f.slice(0,12).arrayBuffer()),S=(a,b)=>String.fromCharCode(...h.slice(a,b));
+    if(S(0,4)!=='RIFF'||S(8,12)!=='sfbk'){alert(f.name+' no es un SoundFont .sf2');continue}
+    const it={id:uid(),parent:'__fonts__',type:'font',name:f.name,size:f.size,blob:f,created:Date.now()};items.push(it);await save(it)}
+  e.target.value='';render()};
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-act]');if(!b)return;
+  const a=({m_nf:'newfolder',m_nl:'newlyrics',m_nn:'newnotes',m_nd:'newdrums'})[b.dataset.act]||b.dataset.act,id=b.dataset.id,t=id&&byId(id);if(a!==b.dataset.act)addMenu=false;
+  if(a==='close'){menuId=null;addMenu=false}
+  else if(a==='add')addMenu=true;
+  else if(a==='menu')menuId=id;
+  else if(a==='open'){cur=id}
+  else if(a==='back'){if(view==='lyrics'||view==='move'||view==='seq')view='folder';else if(view!=='folder'){view='folder';cur=null}else cur=byId(cur).parent}
+  else if(a==='stars'||a==='trash'||a==='fonts')view=a;
+  else if(a==='seq'){editId=id;view='seq';loadAll()}
+  else if(a==='edit'){editId=id;view='lyrics'}
+  else if(a==='newlyrics'){const n=prompt('Nombre de la letra','Letra');if(!n)return render();const L={id:uid(),parent:cur,type:'lyrics',name:n,text:'',created:Date.now()};items.push(L);await save(L);editId=L.id;view='lyrics'}
+  else if(a==='newfolder'){const n=prompt('Nombre de la carpeta','Nueva carpeta');if(!n)return render();const f={id:uid(),parent:cur,type:'folder',name:n,created:Date.now()};items.push(f);await save(f)}
+  else if(a==='rec')return toggleRec();
+  else if(a==='all'){const ids=tracksHere().filter(x=>!x.mute).map(x=>x.id);const on=ids.some(i=>playing.has(i));ids.forEach(i=>on?stop(i):start(i))}
+  else if(a==='play')playing.has(id)?stop(id):start(id);
+  else if(a==='loop'){t.loop=!t.loop;if(playing.has(id))playing.get(id).loop=t.loop;await save(t)}
+  else if(a==='mute'){t.mute=!t.mute;await save(t)}
+  else if(a==='star'){t.starred=!t.starred;await save(t)}
+  else if(a==='newnotes'||a==='newdrums'){const dr=a==='newdrums',n=prompt('Nombre de la pista',dr?'Batería':'Notas');if(!n)return render();
+    const T={id:uid(),parent:cur,type:dr?'drums':'notes',name:n,bpm:120,bars:1,lo:48,dur:1,inst:'',notes:[],created:Date.now()};items.push(T);await save(T);editId=T.id;view='seq';loadAll()}
+  else if(a==='cell'){const T=byId(editId),p=+b.dataset.p,i=+b.dataset.s,k=T.notes.findIndex(n=>n.p===p&&i>=n.s&&i<n.s+n.l);
+    if(k>=0)T.notes.splice(k,1);else T.notes.push({s:i,p,l:T.type==='drums'?1:(T.dur||1)});await save(T);if(k<0)preview(T,p)}
+  else if(a==='bars+'){t.bars=Math.min(8,t.bars+1);await save(t)}
+  else if(a==='bars-'){t.bars=Math.max(1,t.bars-1);t.notes=t.notes.filter(n=>n.s<t.bars*16);await save(t)}
+  else if(a==='oct+'||a==='oct-'){t.lo=Math.min(84,Math.max(12,t.lo+(a==='oct+'?12:-12)));await save(t)}
+  else if(a==='url'){if(dl)return;const u=prompt('Enlace directo a un archivo .sf2',DEFURL);if(!u)return render();dl=true;render();
+    try{const r=await fetch(u);if(!r.ok)throw new Error('HTTP '+r.status);await addFont(await r.blob(),decodeURIComponent(u.split('?')[0].split('/').pop())||'soundfont.sf2')}
+    catch(e){alert('No se pudo importar: '+e.message+'\n\nSi es un bloqueo del sitio (CORS), descarga el archivo y usa Importar .sf2.')}
+    dl=false}
+  else if(a==='import')return document.getElementById('fi').click();
+  else if(a==='delfont'){if(!confirm('¿Eliminar este SoundFont?'))return;delete FONTS[id];delete FP[id];await purge(id)}
+  else if(a==='m_rename'){menuId=null;const n=prompt('Nuevo nombre',t.name);if(n){t.name=n;await save(t)}}
+  else if(a==='m_dup'){menuId=null;await dup(t,t.parent)}
+  else if(a==='m_trash'){menuId=null;t.trashed=true;stop(id);await save(t);if(id===cur){cur=t.parent}}
+  else if(a==='m_move'){menuId=null;moveId=id;view='move'}
+  else if(a==='dest'){const m=byId(moveId);m.parent=id||null;await save(m);view='folder'}
+  else if(a==='restore'){const p=t.parent&&byId(t.parent),ok=!t.parent||(p&&live(p));if(!ok&&t.type==='lyrics'){alert('Restaura primero la carpeta de esta letra.');return}t.trashed=false;if(!ok)t.parent=null;await save(t)}
+  else if(a==='purge'){if(confirm('¿Eliminar para siempre?'))await purge(id)}
+  render();
+});
+Store.init().then(()=>Store.all()).then(async l=>{items=l;loadAll();
+  l.filter(x=>(x.type==='notes'||x.type==='drums')&&!x.bars).forEach(x=>{x.bars=Math.max(1,Math.ceil(Math.max(0,...x.notes.map(n=>n.s+n.l))/16));save(x)});
+  for(const f of l.filter(x=>x.type==='folder'&&x.lyrics)){const L={id:uid(),parent:f.id,type:'lyrics',name:'Letra',text:f.lyrics,created:Date.now()};f.lyrics='';items.push(L);await save(L);await save(f)}
+  render()});
+</script>
+</body>
+</html>
